@@ -39,12 +39,74 @@ const clients = ACCOUNTS.map(acc => {
     return client;
 });
 
+async function checkCache(client, label) {
+    log('INFO', label, '── Cache check ──────────────────────');
+
+    const guilds = client.guilds.cache;
+    log('INFO', label, `Guilds in cache: ${guilds.size}`);
+    for (const [, guild] of guilds) {
+        log('INFO', label, `  📌 Guild: "${guild.name}" (${guild.id})`);
+    }
+
+    const channels = client.channels.cache;
+    const textChannels = [...channels.values()].filter(c => c.type === 'GUILD_TEXT' || c.type === 0);
+    log('INFO', label, `Canali testo in cache: ${textChannels.length}`);
+
+    // Cerca il canale configurato per questo account
+    const acc = ACCOUNTS.find(a => clients[ACCOUNTS.indexOf(a)] === client);
+    if (acc) {
+        const ch = channels.get(acc.channelId);
+        if (ch) {
+            log('OK',   label, `Canale target trovato: #${ch.name} (guild: ${ch.guild?.name})`);
+        } else {
+            log('WARN', label, `Canale target ${acc.channelId} NON in cache — verrà fetchato al primo bump`);
+        }
+    }
+
+    // Verifica se Disboard è visto come membro in qualche guild
+    let disboardFound = false;
+    for (const [, guild] of guilds) {
+        try {
+            const member = await guild.members.fetch(DISBOARD_ID).catch(() => null);
+            if (member) {
+                log('OK',   label, `Disboard trovato in guild "${guild.name}" ✅`);
+                disboardFound = true;
+            } else {
+                log('WARN', label, `Disboard NON trovato come membro in guild "${guild.name}"`);
+            }
+        } catch (e) {
+            log('WARN', label, `Impossibile verificare Disboard in "${guild.name}": ${e.message}`);
+        }
+    }
+    if (!disboardFound) {
+        log('WARN', label, '⚠️  Disboard non trovato in NESSUNA guild — sendSlash potrebbe fallire');
+    }
+
+    // Prova a fetchare le guild commands e cerca /bump
+    for (const [, guild] of guilds) {
+        try {
+            const cmds = await guild.commands.fetch();
+            const bump = cmds.find(c => c.applicationId === DISBOARD_ID && c.name === 'bump');
+            if (bump) {
+                log('OK',   label, `Comando /bump trovato in guild "${guild.name}" ✅`);
+            } else {
+                log('WARN', label, `Comando /bump NON in cache per guild "${guild.name}" (Disboard non è nel server?)`);
+            }
+        } catch (e) {
+            log('WARN', label, `guild.commands.fetch() fallito per "${guild.name}": ${e.message}`);
+        }
+    }
+
+    log('INFO', label, '─────────────────────────────────────');
+}
+
 async function loginAll() {
     for (let i = 0; i < ACCOUNTS.length; i++) {
         try {
             log('INFO', ACCOUNTS[i].label, 'Login...');
             await clients[i].login(ACCOUNTS[i].token);
             await sleep(3000);
+            await checkCache(clients[i], ACCOUNTS[i].label);
         } catch (e) {
             log('ERROR', ACCOUNTS[i].label, `Login fallito: ${e.message}`);
             process.exit(1);
@@ -118,23 +180,41 @@ async function doBump(i) {
     if (!channel) { log('ERROR', acc.label, 'Canale non trovato!'); return { success: false, fatal: true }; }
 
     log('BUMP', acc.label, `Eseguo /bump in #${channel.name} (${channel.guild?.name})...`);
+
+    // Popola la cache delle application commands (comandi globali dei bot).
+    // guild.commands.fetch() da solo non basta — prende solo i comandi della guild.
+    // L'endpoint corretto è /channels/:id/application-commands/search usato da selfbot.
+    await (async () => {
+        // 1. Prova fetchApplicationCommands sul canale (selfbot-v13 >= certe versioni)
+        try {
+            if (typeof channel.fetchApplicationCommands === 'function') {
+                await channel.fetchApplicationCommands();
+                log('INFO', acc.label, 'Cache popolata via channel.fetchApplicationCommands()');
+                return;
+            }
+        } catch (e) { log('WARN', acc.label, `fetchApplicationCommands: ${e.message}`); }
+
+        // 2. Fetch diretto via REST — endpoint che sendSlash usa internamente
+        try {
+            await client.rest.get(
+                `/channels/${acc.channelId}/application-commands/search`,
+                { query: { type: 1, include_applications: true, limit: 25 } }
+            );
+            log('INFO', acc.label, 'Cache popolata via REST /application-commands/search');
+            return;
+        } catch (e) { log('WARN', acc.label, `REST search: ${e.message}`); }
+
+        // 3. Fallback: guild.commands.fetch() (comandi della guild, non globali)
+        try {
+            await channel.guild.commands.fetch();
+            log('INFO', acc.label, 'Cache popolata via guild.commands.fetch() (fallback)');
+        } catch (e) { log('WARN', acc.label, `guild.commands.fetch(): ${e.message}`); }
+    })();
+
     const responsePromise = waitForDisboardResponse(client, acc.channelId, acc.label);
 
     try {
-        // Prima prova application_commands() — più affidabile di sendSlash
-        let bumped = false;
-        try {
-            const appCmds = await channel.application_commands();
-            const bumpCmd = appCmds.find(c => c.name === 'bump' && c.application_id === DISBOARD_ID);
-            if (bumpCmd) { await bumpCmd(); bumped = true; }
-            else { log('WARN', acc.label, '/bump non in application_commands — fallback sendSlash'); }
-        } catch (e) {
-            log('WARN', acc.label, `application_commands fallito (${e.message}) — fallback sendSlash`);
-        }
-
-        if (!bumped) {
-            await channel.sendSlash(DISBOARD_ID, 'bump');
-        }
+        await channel.sendSlash(DISBOARD_ID, 'bump');
     } catch (e) {
         const m = e.message || '';
         log('ERROR', acc.label, `Errore bump: ${m}`);
